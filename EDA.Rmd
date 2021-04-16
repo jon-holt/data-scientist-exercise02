@@ -1,0 +1,846 @@
+---
+title: "An Analysis of US Aviation Accidents"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+author: "Jonathan Holt"
+date: "April 2021"
+
+---
+
+```{r include = FALSE}
+knitr::opts_chunk$set(echo=FALSE, message = F, warning = F)
+```
+
+# Introduction
+
+## Objective
+The objective of this analysis is to uncover insights into US aviation accidents over the last 40 years.
+
+## Data description
+The [NTSB aviation accident database](https://www.ntsb.gov/_layouts/ntsb.aviation/index.aspx) contains information from 1982 and later about civil aviation accidents and selected incidents within the United States, its territories and possessions, and in international waters. Generally, a preliminary report is available online within a few days of an accident. Factual information is added when available, and when the investigation is completed, the preliminary report is replaced with a final description of the accident and its probable cause. Full narrative descriptions may not be available for dates before 1993, cases under revision, or where NTSB did not have primary investigative responsibility.
+
+For each observation (accident), the NTSB provides 33 variables detailing the accident. Details include a mix of numeric (e.g., number of fatalities), categorical (e.g., engine type), and textual (e.g., written narrative) information.
+
+## Methodology
+I began the analysis by examining distributions and frequencies of numerical and categorical variables. Next, I proceeded to analyze the text fields by quantifying the distributions of words and topics within and across the reports. Finally, I synthesized numerical, categorical and textual data to uncover comprehensive insights into the NTSB data set. 
+
+To focus the analysis, I simplified the data set in a few small but important ways. Specifically, I applied the following restrictions:
+
+* Considered accidents only (omitting incidents). The differences between accidents and incidents are described [here](https://www.eaa.org/eaa/aircraft-building/BuilderResources/next-steps-after-your-airplane-is-built/operating-articles/incidents-accidents-emergencies/aircraft-accident-and-incident-reporting).
+* Omitted accidents for which fatality information is unavailable
+* Considered accidents involving airplanes or helicopters only
+* Considered common engine types only (Reciprocating, Turbo Fan, Turbo Jet, Turbo Prop, Turbo Shaft)
+
+# Results
+
+## Distributions and frequencies of numerical and categorical variables
+
+```{r, echo=F, message=F, warning=F}
+# load packages
+library(XML)
+library(tidyverse)
+library(tidytext)
+library(RColorBrewer)
+library(lubridate)
+library(tm)
+library(jsonlite)
+library(topicmodels)
+library(glmnet)
+library(maps)
+theme_set(theme_minimal()) # set the ggplot theme
+```
+
+```{r, echo=F, message=F, warning=F}
+# load the data
+data <- xmlParse("data/AviationData.xml") # parse xml file
+xml_data <- xmlToList(data) # put child nodes into a list
+df <- data.frame(matrix(unlist(xml_data$ROWS), # convert list to dataframe
+                        nrow=length(xml_data$ROWS), 
+                        byrow=TRUE))
+```
+
+```{r, echo=F, message=F, warning=F}
+# clean the data
+
+# add column names
+colnames(df) <- c("EventID", "InvestigationType", "AccidentNumber", "EventDate", "Location", "Country", "Latitude", "Longitude", "AirportCode", "AirportName", "InjurySeverity", "AircraftDamage", "AircraftCategory", "RegistrationNumber", "Make", "Model", "AmateurBuilt", "NumberOfEngines", "EngineType", "FARDescription", "Schedule", "PurposeOfFlight", "AirCarrier", "TotalFatalInjuries", "TotalSeriousInjuries", "TotalMinorInjuries", "TotalUninjured", "WeatherCondition", "BroadPhaseOfFlight", "ReportStatus", "PublicationDate")
+
+# list of expressions to remove from the AirCarrier field
+remove <- c("\\*|\\(|\\)", ".*:", "INC", "LTD", ",", "\\.", "\\[|\\]", "EMS") 
+
+# wrangle
+df <- df %>%
+  # missing values to NA
+  mutate_all(na_if, "") %>% 
+  # extract date, month, year
+  mutate(EventDate = mdy(EventDate), 
+         Year = year(EventDate),
+         Month = month(EventDate, label = T)) %>%
+  # fatal or non-fatal accidents only
+  filter(InvestigationType == "Accident") %>% 
+  mutate(InjuryType = ifelse(InjurySeverity %in% c("Non-Fatal", "Unavailable"), as.character(InjurySeverity), "Fatal")) %>%
+  filter(InjuryType %in% c("Fatal", "Non-Fatal")) %>% 
+    # airplanes or helicoptors only (assume NA is airplane)
+  filter(AircraftCategory %in% c("Airplane", "Helicopter", NA)) %>%
+  # select most common engine types
+  filter(EngineType %in% c("Reciprocating", "Turbo Fan", "Turbo Jet", "Turbo Prop", "Turbo Shaft")) %>% 
+  # re-code the number of engines
+  mutate(NumberOfEngines= case_when( 
+  NumberOfEngines == "0" ~ '0',
+  NumberOfEngines == "1" ~ '1',
+  NumberOfEngines == "2" ~ '2',
+  NumberOfEngines == "4" ~ '3+',
+  NumberOfEngines == "4" ~ '3+',
+  NumberOfEngines == "18" ~ '3+',
+  NumberOfEngines == "24" ~ '3+',
+)) %>%
+  # re-code the flight schedule
+  mutate(Schedule= case_when( 
+  Schedule == "SCHD" ~ 'Scheduled or commuter',
+  Schedule == "NSCH" ~ 'Non-scheduled or air taxi')) %>%
+  # re-code the weather condition
+  mutate(WeatherCondition= case_when( 
+  WeatherCondition == "VMC" ~ 'high visibility',
+  WeatherCondition == "IMC" ~ 'low visibility')) %>%
+  # clean up the airport names
+  mutate(AirportName = toupper(AirportName)) %>% 
+  mutate(AirportName = ifelse(grepl("PRIVATE", AirportName, fixed = T)==T, "PRIVATE", as.character(AirportName))) %>%
+  mutate(AirportName = na_if(AirportName, "N/A")) %>%
+  mutate(AirportName = na_if(AirportName, "NONE")) %>%
+  # clean up the aircraft names
+  mutate(Make = ifelse(grepl("ROBINSON", Make, fixed = T)==T, "ROBINSON", as.character(Make))) %>% 
+  mutate(Make = toupper(Make)) %>% 
+  # clean up the airlines
+  mutate(AirCarrier = toupper(as.character(AirCarrier))) %>% 
+  mutate(AirCarrier = str_remove_all(AirCarrier, paste(remove, collapse = "|"))) %>%
+  mutate(AirCarrier = str_trim(AirCarrier, side = "both")) %>%
+  mutate(AirCarrier = str_replace(AirCarrier, "AIR LINES", "AIRLINES"))
+```
+
+### Time and location of accident
+
+#### Year of accident
+
+```{r, echo=F, message=F, warning=F}
+# time series plot
+df %>%
+  group_by(Year, InjuryType) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(Year, n, color=InjuryType)) + 
+  geom_line() +
+  scale_x_continuous(limits = c(1982, 2016), breaks = seq(1982, 2015, 1)) + 
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Annual counts of fatal and non-fatal accidents",
+       x = "Year",
+       y = "Count")
+```
+
+#### Monthly distribution of accidents
+
+```{r, echo=F, message=F, warning=F}
+# which months have the most accidents?
+df %>%
+  group_by(Month) %>%
+  summarise(n = n()) %>%
+  drop_na() %>%
+  mutate(freq = n/(sum(n))) %>%
+  ggplot(aes(Month, freq)) + 
+  geom_bar(stat = "identity", fill="brown") +
+  theme(legend.position = "none") +
+  labs(title = "Accidents by month",
+       x = NULL,
+       y = "Relative Frequency")
+```
+
+#### Accidents outside the United States
+
+```{r, echo=F, message=F}
+# extract world map
+world_map <- map_data("world")
+
+df %>%
+  group_by(Country) %>%
+  subset(!(Country %in% c("United States", ""))) %>%
+  summarise(count = n()) %>%
+  # create some break points
+  mutate(count_group = cut(count,
+                           breaks = c(-Inf, 10, 25, 50, 100, 200, Inf),
+                           labels = c("Fewer than 10", "10-25", "25-50", "50-100", "100-200", "More than 200"))) %>%
+  ggplot(aes(map_id = Country)) +
+  geom_map(aes(fill = fct_rev(as.factor(count_group))), map = world_map) +
+  expand_limits(x = world_map$long, y = world_map$lat) +
+  theme_void() +
+  coord_fixed() +
+  scale_fill_manual(name = "# accidents", values = rev(brewer.pal(6, name = "YlOrRd"))) +
+  labs(title = "Accidents involving US-related carriers outside the US",
+       subtitle = "Total accidents between 1982-2015")
+```
+
+#### Latitudinal patterns
+
+```{r, echo=F, message=F, warning=F}
+df %>%
+  # convert Latitude to numeric
+  mutate_at(vars(Latitude), ~as.numeric(as.character(.))) %>% 
+  ggplot(aes(x=Latitude, after_stat(count), color=InjuryType, fill=InjuryType)) +
+  geom_density(position="fill", alpha=0.5, adjust=2) +
+  coord_flip() +
+  labs(title = "Proportion of fatal accidents at different latitudes",
+       y = "Proportion",
+       x = "Latitude")
+```
+
+#### Airports
+
+```{r, echo=F, message=F, warning=F}
+df %>%
+  select(AirportName, AircraftCategory, InjuryType) %>%
+  drop_na() %>%
+  group_by(AirportName) %>%
+  summarise(n = n()) %>%
+  mutate(Freq = n / sum(n)) %>%
+  top_n(n=5) %>%
+  ggplot(aes(x=reorder(AirportName,n), y=n, fill=AirportName)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(title = "Airports with the most accidents",
+       subtitle = "'Private' airports are not identified further in the dataset",
+       x = NULL,
+       y = "Number of accidents") 
+```
+
+#### Insights: What did we learn from time and location variables? 
+
+Since the 1980s, the annual number of aviation accidents has decreased by over sixty percent. The more pronounced reduction in non-fatal accidents compared to fatal accidents suggests that non-fatal accidents are generally easier to avoid. Accidents were more frequent during the summer months (peaking in July), suggesting that most crashes were related to private flights (hobbyists, agricultural missions, etc.), which have a more dramatic annual trend compared to commercial flights.
+
+The frequency of plane crashes outside the US is likely correlated with the volume of flights (i.e., more flights to Canada means more accidents in Canada). However, there is a striking contrast between the lethality of accidents in the northern and southern hemispheres. This could be due in part to the fact that US flights to the southern hemisphere are necessarily longer in duration, and are often over water for much of the journey. 
+
+The vast majority of accidents involved private airports, which are unnamed in the NTSB data set. This trend lends further evidence to the notion that most accidents were related to small-plane, non-commercial endeavors. 
+
+### Severity of accidents
+
+#### Number of fatalities
+
+```{r, echo=F, message=F, warning=F}
+df %>% 
+  filter(InjuryType %in% "Fatal") %>%
+  # remove punctuation from the InjurySeverity field
+  mutate(Deaths = as.numeric(unlist(str_extract_all(InjurySeverity, "(?<=\\().+?(?=\\))")))) %>%
+  ggplot(aes(x=Deaths)) +
+  geom_histogram(binwidth = 1, fill="brown") +
+  # square root scale to show outliers
+  scale_y_sqrt() + 
+  labs(title = "How many people die in each fatal accident?",
+       x = "Deaths",
+       y = "Number of accidents")
+```
+
+```{r, echo=F, message=F, warning=F}
+# Plot 1-10 fatalities only
+df %>% 
+  filter(InjuryType %in% "Fatal") %>%
+  # remove punctuation from the InjurySeverity field
+  mutate(Deaths = as.numeric(unlist(str_extract_all(InjurySeverity, "(?<=\\().+?(?=\\))")))) %>%
+  ggplot(aes(Deaths)) +
+  geom_bar(stat = "count", fill="brown") +
+  scale_x_continuous(limits=c(0,11), breaks = seq(1,10,1)) +
+  labs(title = "Number of deaths in fatal accidents (10 or fewer deaths)",
+     x = "Deaths",
+     y = "Number of accidents")
+```
+
+### Number of injuries
+
+```{r, echo=F, message=F, warning=F}
+# time-series of each injury type
+df %>%
+  mutate_at(vars(TotalFatalInjuries, TotalSeriousInjuries, TotalMinorInjuries, TotalUninjured), ~as.numeric(as.character(.))) %>% 
+  pivot_longer(cols = starts_with("Total"), names_to = "Severity", values_to = "Individuals") %>%
+  mutate(Severity = str_remove(Severity, "Total")) %>%
+  group_by(Year, Severity) %>%
+  summarise(n = sum(Individuals, na.rm = T)) %>%
+  ggplot(aes(x=Year, y=n, color=Severity)) + 
+  geom_line() +
+  scale_x_continuous(limits = c(1982, 2016), breaks = seq(1982, 2015, 1)) + 
+  theme(axis.text.x = element_text(angle=90)) +
+    labs(title = "Annual number of injuries from 1982-2015",
+       x = "Year",
+       y = "Count")
+
+```
+
+#### Insights: What did we learn from the injury and fatality data? 
+
+Almost all fatal crashes involved one or two victims. Fatal crashes involving 50 or more people have happened several times since the 1980s, but these cases are extremely rare. It is common to survive an aviation accident with no injuries, suggesting that most accidents in the NTSB database are minor. Historically, when injuries did occur, they were most often fatal; however, in recent years, fatal injuries have become about as rare as non-fatal injuries, suggesting that aircraft have become safer - not only in terms of flying, but also in terms of surviving accidents when they occur.
+
+### Aircraft information
+
+#### Aircraft manufacturers most commonly associated with fatal accidents
+
+```{r, echo=F, message=F, warning=F}
+# Identify the top airplane and helicoptor companties associated with fatal accidents 
+df %>%
+  select(Make, AircraftCategory, InjuryType) %>%
+  filter(AircraftCategory %in% c("Airplane", "Helicopter"),
+         InjuryType == "Fatal") %>%
+  drop_na() %>%
+  group_by(InjuryType, AircraftCategory, Make) %>%
+  summarise(n = n()) %>%
+  top_n(n=10) %>%
+  mutate(Freq = n / sum(n)) %>%
+  ggplot(aes(x=reorder(Make, Freq), y=Freq, fill=Make)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_grid(vars(AircraftCategory), scales = "free") +
+  theme(legend.position = "none") +
+  labs(title = "Top 10 deadly airplane and helicoptor manufacturers",
+       subtitle = NULL,
+       x = NULL,
+       y = "Relative frequency")
+```
+
+#### Aircraft models most commonly associated with fatal accidents
+
+```{r, echo=F, message=F, warning=F}
+# Identify the top models associated with fatal accidents 
+df %>%
+  select(Make, Model, AircraftCategory, InjuryType) %>%
+  filter(AircraftCategory %in% c("Airplane", "Helicopter"),
+         InjuryType=="Fatal") %>%
+  drop_na() %>%
+  mutate(MakeModel = paste(Make, Model, sep = " ")) %>%
+  group_by(InjuryType, AircraftCategory, MakeModel) %>%
+  summarise(n = n()) %>%
+  top_n(n=10) %>%
+  mutate(Freq = n / sum(n)) %>%
+  ggplot(aes(x=reorder(MakeModel, Freq), y=Freq, fill=MakeModel)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_grid(vars(AircraftCategory), scales = "free") +
+  theme(legend.position = "none") +
+  labs(title = "Top 10 deadly airplane and helicoptor models",
+       subtitle = NULL,
+       x = NULL,
+       y = "Relative frequency")
+```
+
+#### Engine type
+
+```{r, echo=F, message=F, warning=F}
+# density engine type
+df %>%
+  select(EngineType, Year) %>%
+  drop_na() %>%
+  group_by(EngineType, Year) %>%
+  summarise(n = n()) %>%
+  mutate(Freq = n/sum(n)) %>%
+  ggplot(aes(Year, Freq, color=EngineType)) + 
+  geom_smooth(alpha = 0.2) + # loess smoothing (generalized moving avg)
+  scale_x_continuous(limits = c(1982, 2016), breaks = seq(1982, 2015, 1)) + 
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Density plot of engines involved in accidents from 1982-2015",
+       subtitle = "Curves are smoothed using a moving average; the 95% confidence interval is shaded",
+       x = "Year",
+       y = "Density")
+```
+
+#### Insights: What did we learn from aircraft make, model and engine type?
+
+Small airplanes, primarily manufactured by Cessna, Piper, and Beech, top the list of fatal accidents. These lighweight, propeller-powered airplanes have considerably higher representation in the NTSB dataset compared to larger, jet-engine models. Two helicoptor companies manufacture the majority of vehicles inolved in deadly accidents: Robinson and Bell.
+
+Regarding specific models, the top 10 deadliest airplanes were single-engine, 2-5 passenger planes. The Cessna 172, the most popular plane in history, was also the highest-represented in terms of deadly accidents. Robinson R44, the world's best-selling general aviation helicoptor, topped the list for deadly helicoptors. It is important to emphasize that the airplanes and helicoptors described here were not only the most common in deadly accidents, but also the most common, generally. 
+
+Reciprocating engines, which are internal combustion engines used on propeller planes, were found in the vast majority of aviation accidents - and surely the majority of airplanes in the US. The density plot of engines over time tells an interesting history of the evolution of engines. Accidents involving the reciprocating engine peaked at the beginning of the study period and have steadily declined over time. Accidents involving turbo-charged engines, on the other hand, peaked around the turn of the 21st century, and have decreased since the early 2000s. 
+
+### Airline Logistics
+
+#### Scheduled and non-scheduled flights
+
+```{r, echo=F, warning=F, message=F}
+df %>%
+  select(Schedule, InjuryType) %>%
+  drop_na() %>%
+  group_by(Schedule, InjuryType) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n/sum(n)) %>%
+  ggplot(aes(x=Schedule, y=freq, fill=InjuryType)) +
+  geom_bar(stat = "identity", position = "stack") + 
+  scale_fill_brewer(palette = "Paired") +
+  coord_flip() +
+  labs(title = "Fatality of scheduled and non-scheduled flights",
+       x = "",
+       y = "Relative frequency")
+```
+
+#### Purpose of flight
+
+```{r, echo=F, warning=F, message=F}
+# purpose of flight
+df %>%
+  select(PurposeOfFlight, InjuryType) %>%
+  drop_na() %>%
+  group_by(PurposeOfFlight, InjuryType) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n/sum(n)) %>%
+  ggplot(aes(x=InjuryType, y=freq, fill=InjuryType)) +
+  geom_bar(stat = "identity") + 
+  facet_wrap("PurposeOfFlight") +
+  theme(axis.title.x=element_blank(),
+      axis.text.x=element_blank(),
+      axis.ticks.x=element_blank()) +
+  scale_fill_brewer(palette = "Paired") +
+  labs(title = "Fatality of various flight missions",
+       x = "",
+       y = "Relative frequency")
+```
+
+#### Air carrier
+
+```{r, echo=F, warning=F, message=F}
+# fatality rate for airlines with > 15 accidents
+df %>%
+  select(AirCarrier, InjuryType) %>%
+  filter(!(AirCarrier=="")) %>%
+  drop_na() %>%
+  group_by(AirCarrier) %>%
+  summarise(n = n(),
+            fatal = sum(InjuryType=="Fatal"),
+            ratio = fatal/n) %>%
+  filter(n>15) %>%
+  ggplot(aes(x=reorder(AirCarrier, ratio), y=ratio, fill=AirCarrier)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(title = "Airlines that exhibit high rates of deadly accidents",
+       subtitle = "All airlines below have greater than 15 accidents in the NTSB data",
+       x = "",
+       y = "Fraction of accidents that are fatal")
+```
+
+#### Weather condition
+
+```{r, echo=F, message=F, warning=F}
+df %>%
+  select(WeatherCondition, InjuryType) %>%
+  drop_na() %>%
+  group_by(WeatherCondition, InjuryType) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n/sum(n)) %>%
+  ggplot(aes(x=WeatherCondition, y=freq, fill=InjuryType)) +
+  geom_bar(stat = "identity", position = "stack") + 
+  scale_fill_brewer(palette = "Paired") +
+  coord_flip() +
+  labs(title = "Does visibility affect the survivability of an accident?",
+       x = "",
+       y = "Relative frequency")
+```
+
+#### Broad phase of flight
+
+```{r, echo=F, message=F, warning=F}
+# relative proportions of broad phase of flight, by year
+df %>%
+  filter(BroadPhaseOfFlight %in% c("APPROACH", "CRUISE", "LANDING", "MANEUVERING", "TAKEOFF")) %>%
+  group_by(InjuryType, Year, BroadPhaseOfFlight) %>%
+  summarise(n=n()) %>%
+  mutate(freq = n/sum(n)) %>%
+  ggplot(aes(x=Year, y=freq, fill=BroadPhaseOfFlight)) +
+  geom_bar(stat = "identity", position = "stack", width = 1) +
+  facet_wrap(vars(InjuryType), ncol = 1) +
+  scale_x_continuous(limits = c(1982, 2016), breaks = seq(1982, 2015, 1)) + 
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  scale_fill_brewer(palette = "Paired") +
+  labs(title = "Which phases of flight are associated with fatal and non-fatal accidents?",
+       x = "Year",
+       y = "Fraction")
+```
+
+#### Insights: What did we learn by analyzing flight logistics?
+
+About 10% of scheduled or commuter accidents were fatal, compared to 25% of non-scheduled or air taxi flights. Regarding various flight missions, some endeavors were more dangerous than others. For instance, about half of accidents at air/race shows were fatal. Accidents involving flights intended to fight fires were also highly dangerous. Instructional flight accidents, on the other hand, had a very low fatality rate. 
+
+To assess airline safety, I quantified the fatality rate (deadly accidents / total accidents) for all airlines having more than 15 accidents in the NTSB database. More than half of accidents involving Petroleum Helicoptors (a company that ferries workers to offshore drilling platforms in the Gulf of Mexico) were fatal. Of the major US commercial airlines, Southwest and Delta had the lowest rate of deadly accidents. 
+
+Weather appeared to play a major role in fatal aviation accidents. For accidents with low visibility, more than half were fatal. On the contrary, only about 10% of accidents with good visibility were fatal. 
+
+From 1982-2015, the majority of fatal accidents occurred during the cruise or maneuvering phases of flight. However, in recent years, the cruise phase has become much safer. Takeoff and landing phases account for almost all non-fatal accidents. 
+
+## Analyzing textual data: Word counts 
+
+Many of the accident reports in the NTSB data set include a "probable cause" statement. I created a corpus from these statements, then quantified the term frequency-inverse document frequency (TF-IDF) to reveal the most relevant (important) words in the corpus. Next, I assessed correlations between words and different types of accidents. 
+
+```{r}
+# load the text data
+
+# list of json files to read
+json_files <- list.files(path = "data", pattern="*.json", full.names = T)
+# read data into list
+big_list <- lapply(json_files, function(x) read_json(x, simplifyVector = T))
+# create data.frame from list
+df_text <- do.call(rbind, purrr::flatten(big_list))
+# merge to main dataframe
+df <- merge(df, df_text, by.x="EventID", by.y = "EventId")
+```
+
+```{r}
+# create corpus
+corpus <- Corpus(VectorSource(df$probable_cause))
+
+# remove line breaks, words, punctuation, numbers
+line_break <- function(x) gsub("\\\\r\\\\n", " ", x) 
+docs.s <- tm_map(corpus, line_break)
+docs.s <- tm_map(docs.s, content_transformer(tolower))
+docs.s <- tm_map(docs.s, removeWords, stopwords("english"))
+docs.s <- tm_map(docs.s, removePunctuation, preserve_intra_word_dashes = TRUE)
+docs.s <- tm_map(docs.s, removeNumbers)
+docs.s <- tm_map(docs.s, removeWords, c("th"))
+docs.s <- tm_map(docs.s, stripWhitespace)
+
+# remove words that appear in less than 1%, or more than 80% of documents
+ndocs <- length(corpus)
+minDocFreq <- ndocs * 0.01
+maxDocFreq <- ndocs * 0.8
+
+# generate TF-IDF
+dtm_tfidf<- DocumentTermMatrix(docs.s, control = list(bounds = list(global = c(minDocFreq, maxDocFreq)),
+                                                      weighting = weightTfIdf))
+```
+
+### What are the most relevant words (TF-IDF) in the "probable cause" descriptions?
+
+```{r}
+# generate word cloud
+freq = data.frame(sort(colSums(as.matrix(dtm_tfidf)), decreasing=TRUE))
+wordcloud::wordcloud(rownames(freq), freq[,1], 
+                     max.words=40, 
+                     colors=brewer.pal(1, "Dark2"))
+```
+
+### Are the probable cause descriptions related to the fatality of accidents?
+
+To assess relationships between probable cause and fatality, I constructed a regularized logistic regression model (ridge regression) to predict fatal accidents from the TF-IDF word frequencies. Ridge regression is an appropriate model for this application because it reduces the dimensionality of the model; specifically, the penalization parameter $\lambda$ eliminates words that are not very important. Using the weights from the regression model, I identified words that were most closely correlated with fatal accidents.  
+
+```{r}
+# convert if-idf DTM to matrix
+model_mat <- as.matrix(dtm_tfidf)
+
+# response varible (fatality)
+target <- as.matrix(ifelse(df$InjuryType=="Fatal", 1, 0))
+
+# split data into training and testing sets (75% training)
+set.seed(123)
+smp_size <- floor(0.75 * nrow(model_mat))
+train_ind <- sample(seq_len(nrow(model_mat)), size = smp_size)
+
+train.x <- model_mat[train_ind, ]
+train.y <- target[train_ind,]
+test.x <- model_mat[-train_ind, ]
+test.y <- target[-train_ind,]
+
+# fit model using a subset of the data to save computation time
+cvfit=cv.glmnet(train.x[1:5000,], train.y[1:5000], 
+                family="binomial", 
+                type.measure = "auc")
+```
+
+#### Fitting the penalized logistic regression model
+
+```{r}
+# plot the penalization parameter against the auc
+plot(cvfit)
+```
+
+Observe that the best-fit model (highest AUC) utilizes about 100 different words to predict whether or not an accident is fatal. The model is a relatively strong predictor of fatality, as evidenced by the AUC (AUC > 0.5 is better than chance). 
+
+#### What words are most strongly correlated with fatal accidents?
+
+```{r}
+# extract coefficient values for optimal lambda
+coeffs <- coef(cvfit, s = "lambda.min")
+  
+# put word names and coefs into data frame
+df_plot <- data.frame(words = colnames(model_mat)[coeffs@i], # extract words 
+                    coefs = coeffs@x[-1]) # extract coefs, except intercept
+
+# plot
+df_plot %>%
+  arrange(desc(coefs)) %>%
+  top_n(15) %>%
+  ggplot(aes(x=reorder(words, coefs), y=coefs, fill=words)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(y = "weight",
+       x = NULL,
+       title = "Words correlated with fatal accidents",
+       subtitle = NULL)
+```
+
+#### What words are most strongly correlated with non-fatal accidents?
+
+```{r}
+# plot
+df_plot %>%
+  arrange(desc(coefs)) %>%
+  top_n(-15) %>%
+  ggplot(aes(x=reorder(words, coefs), y=coefs, fill=words)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(y = "weight",
+       x = NULL,
+       title = "Words correlated with non-fatal accidents",
+       subtitle = "Negative weight means less fatal")
+```
+
+#### Insights: What did we learn from word frequencies in the "probable cause" statements?
+
+By constructing a TF-IDF matrix for all probable cause entries, I showed that words like "failure", "loss", and "fuel" are the most important terms in the corpus, meaning that they are relevant for distinguishing one probable cause statement from another. 
+
+The results of the logistic regression model suggest that fatal accidents are highly correlated with instrument failure, bad weather, low visibility, and stalling. On the other hand, non-fatal accidents are highly correlated with takeoff/landing and windy conditions.
+
+## Topic modeling of textual data
+
+To further analyze the "probable cause" statements, I uncovered common themes within the written statements using the latent Dirichlet allocation (LDA) topic model. The LDA model posits that each document (probable cause statement) is a mixture of overlapping topics, which themselves are mixtures of overlapping words.
+
+I identified and characterized the major topics within the collection of probable cause statements. Then, I examined the relationships between topic frequency and other characteristics of aviation accidents. 
+
+Finally, I constructed a logistic regression model to assess the relationships between topics and the fatality of accidents. 
+
+### What is the best number of topics to use for LDA?
+
+```{r}
+# generate train and test set
+set.seed(123)
+smp_size <- floor(0.75 * nrow(df))
+train_ind <- sample(seq_len(nrow(df)), size = smp_size)
+train_set <- df[train_ind, ]
+test_set <- df[-train_ind, ]
+
+# function to generate DTM from a column of a dataframe
+source("NTSB-Functions.r")
+dtm_train <- make_DTM(train_set$probable_cause)
+dtm_test <- make_DTM(test_set$probable_cause)
+
+# remove documents that have empty rows - TRAIN
+sel_idx <- slam::row_sums(dtm_train) > 0
+dtm_train <- dtm_train[sel_idx, ]
+
+# remove documents that have empty rows - TEST
+sel_idx <- slam::row_sums(dtm_test) > 0
+dtm_test <- dtm_test[sel_idx, ]
+
+# loop to find best n topics
+perp <- NULL
+ntop <- seq(5,25,5)
+j=1
+for (i in ntop) {
+  topicModel <- LDA(dtm_train, i, method="Gibbs", control=list(iter = 500, verbose = 25))
+  perp[j] <- perplexity(topicModel, newdata = dtm_train, estimate_theta=FALSE)
+print(perp[j])
+print(i)
+j = j+1
+}
+
+# plot results
+data.frame(ntop = seq(5,25,5), perp=perp) %>%
+  ggplot(aes(x=ntop, y=perp)) +
+  geom_point()
+```
+
+Perplexity (lower is better) decreases with the number of topics. For the sake of interpretation, I used 10 topics for the LDA model. 
+
+```{r}
+# Generate DTM (not TF-IDF)
+dtm <- make_DTM(df$probable_cause)
+
+# remove documents that have empty rows
+sel_idx <- slam::row_sums(dtm) > 0
+dtm_lda <- dtm[sel_idx, ]
+df_lda <- df[sel_idx, ]
+
+# number of topics
+K <- 10
+
+# set random number generator seed
+set.seed(123)
+
+# compute the LDA model, inference via 500 iterations of Gibbs sampling
+topicModel <- LDA(dtm_lda, K, method="Gibbs", control=list(iter = 500, verbose = 25))
+
+# extract model coefs
+tmResult <- posterior(topicModel)
+theta <- tmResult$topics
+beta <- tmResult$terms
+```
+
+### What are the most common words in each of the 10 topics?
+
+```{r}
+tidy(topicModel) %>%
+  group_by(topic) %>%
+  top_n(6, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta) %>%
+  mutate(
+    topic = factor(topic),
+    term = reorder_within(term, beta, topic)
+  ) %>%
+  ggplot(aes(term, beta, fill = topic)) +
+  geom_bar(alpha = 0.8, stat = "identity", show.legend = FALSE) +
+  scale_x_reordered() +
+  facet_wrap(~topic, scales = "free", ncol = 3) +
+  coord_flip() +
+  labs(title = "Topic descriptions",
+       x = NULL,
+       y = "beta")
+```
+
+General themes can be inferred from each topic. I chose two topics to investigate further:
+
+* Topic 1 ("Bad weather")
+  + "flight"
+  + "conditions"
+  + "factors"
+  + "wind"
+  + "weather"
+  + "terrain"
+* Topic 6 ("Dangerous landing")
+  + "pilots"
+  + "failure"
+  + "maintain"
+  + "clearance"
+  + "approach"
+  + "collision"
+* Topic 7 ("Airplane Stall")
+  + "failure"
+  + "maintain"
+  + "airspeed"
+  + "altitude"
+  + "inadvertent"
+  + "resulted"
+
+### Investigating individual topics 
+
+#### Topic 1: Bad weather
+
+```{r}
+# function to scale a variable to 0-1
+range01 <- function(x){(x-min(x))/(max(x)-min(x))}
+
+tmp_top <- cbind(df_lda, theta) %>%
+ filter(Country %in% c("United States")) %>%
+ group_by(Month) %>%
+ summarise(value = mean(`1`)) %>%
+  mutate(value = range01(value)) %>%
+ arrange(desc(value)) %>%
+  mutate(dummy = factor(Month, ordered = F)) # for plotting
+
+# Plot
+ggplot(tmp_top, aes(Month, value, fill=dummy)) + 
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(title = "Which months are highly correlated with bad-weather accidents?",
+       subtitle = "Greater theta implies worse weather",
+       x = "",
+       y = "Theta (rescaled)")
+       
+```
+
+#### Topic 6: Dangerous landing: What are the top 10 airports associated with landing accidents?
+
+```{r}
+# which airports are correlated with dangerous landing?
+tmp_top <- cbind(df_lda, theta) %>%
+ filter(Country %in% c("United States")) %>%
+  mutate(State = str_extract(Location, '\\b[^,]+$')) %>% # everything after the comma
+  filter(State %in% states$State) %>% # remove puerto rico, etc
+  drop_na(AirportName) %>%
+  filter(InjuryType=="Fatal") %>%
+  group_by(State, AirportName) %>%
+  summarise(value = mean(`4`)) %>%
+  arrange(desc(value)) %>%
+  rename("Dangerous landing value" = "value")
+
+head(tmp_top, 10)
+```
+
+#### Topic 7: Airplane stall
+
+```{r}
+# get us map data
+states <- map_data("state") %>% # download state data
+  mutate(region = str_to_title(region))
+# add the state abbreviation
+states$State <- state.abb[match(states$region,state.name)]
+```
+
+```{r}
+tmp_top <- cbind(df_lda, theta) %>%
+  filter(Country %in% c("United States")) %>%
+  mutate(State = str_extract(Location, '\\b[^,]+$')) %>% # everything after the comma
+  filter(State %in% states$State) %>% # remove puerto rico, etc
+  group_by(State) %>%
+  summarise(value = mean(`7`)) %>%
+  right_join(states, by="State")
+
+ggplot(data = tmp_top, mapping = aes(x = long, y = lat, group = group, fill = value)) +
+  geom_polygon(color = "gray90", size = 0.1) +
+  coord_map(projection = "albers", lat0 = 39, lat1 = 45) +
+  scale_fill_gradient(
+                      breaks=c(min(tmp_top$value),max(tmp_top$value)),
+                      labels=c("Minimum","Maximum"),
+                      low = "white",
+                      high = "brown") + 
+  labs(title = "Which states have the highest frequencies of accidents related to stalling?",
+       fill = "") +
+  ggthemes::theme_map() 
+```
+
+### What are the correlations between topics and fatal accidents?
+
+#### Fitting a logistic regression model
+
+Unlike the TF-IDF model, there is no need to use regularized regression because the number of covariates is small. 
+
+```{r}
+# prepare the data
+tmp_top <- cbind(df_lda, theta) %>%
+  mutate(InjuryBin = ifelse(InjuryType=="Fatal", 1, 0)) %>%
+  select(InjuryBin, `1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`, `10`) %>%
+  mutate_at(vars(-InjuryBin), scale) # center and scale
+
+# apply informative names to topics
+topicNames <- apply(terms(topicModel, 5), 2, paste, collapse = " ") 
+colnames(tmp_top) <- c("InjuryBin", topicNames)
+
+# logistic regression
+mod <- glm(InjuryBin ~ .,
+           family = "binomial", data = tmp_top)
+
+# plot the coefficients
+coefplot::coefplot(mod, sort = "magnitude",
+                   title = "Coefficient estimates",
+                   ylab = "Topic",
+                   intercept = F)
+```
+
+### Insights: What did we learn from LDA topic modeling of the "probable cause" statements?
+
+By setting the number of topics (k) equal to 10, each topic had a straighforward interpretation as a reasonable cause for accident. For instance, Topic 10 ("fuel", "due", "inadequate", "loss", "preflight", "exhaustion") corresponds to a scenario where there was a shortage of fuel midflight. To corroborate my interpretation of the topics, and to better understand their relationships with other flight details, I pursued a few of the topics further. A heat map of Topic 7 (airplane stall) revealed high freqencies over the Rocky Mountains, a region of verifiable stall risk. Topic 6 (dangerous landing) provides a means for ranking the airports with the most dangerous runways. Waterloo Regional Airport in IA 
+
+## A comprehensive assessment
+
+
+
+# Conclusion
+
+

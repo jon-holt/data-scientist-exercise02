@@ -1,0 +1,658 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+## Load the data
+
+```{r}
+library(tidyverse)
+library(jsonlite)
+```
+
+```{r}
+# parse the xml file
+data <- xmlParse("data/AviationData.xml")
+
+# put all child nodes of the root node into a list
+xml_data <- xmlToList(data)
+
+# convert the list into a dataframe
+df <- data.frame(matrix(unlist(xml_data$ROWS), nrow=length(xml_data$ROWS), byrow=TRUE))
+```
+
+Load the text data
+
+```{r}
+# list of files to read
+json_files <- list.files(path = "data", pattern="*.json", full.names = T)
+
+# read data into list
+big_list <- lapply(json_files, function(x) read_json(x, simplifyVector = T))
+
+# create data.frame from list
+df_text <- do.call(rbind, flatten(big_list))
+
+# merge
+df <- merge(df, df_text, by.x="EventID", by.y = "EventId")
+```
+
+# Text Analyis
+
+a token is a word (or another unit of text)
+
+```{r}
+library(tidytext)
+data(stop_words)
+
+# count the words
+tidy_narrative <- df %>%
+  select(EventID, narrative) %>%
+  unnest_tokens(word, narrative) %>% #token = "ngrams", n = 2
+  anti_join(stop_words) %>%
+  mutate(word = str_replace_all(word, "[:digit:]", "")) %>% # remove numbers
+  mutate(word = str_replace_all(word, "[[:punct:]]", "")) %>% # remove punctuation
+  mutate(word = na_if(word, "")) %>%
+  drop_na() %>%
+  count(EventID, word, sort = T)
+  
+# tf-idf
+df_tfidf <- tidy_narrative %>%
+  bind_tf_idf(word, EventID, n) 
+```
+
+```{r}
+# plot tf-idf for accident type
+df_tfidf %>%
+  left_join(df) %>%
+  filter(InvestigationType == "Accident") %>% # remove incidents, which are always non-fatal
+  mutate(InjuryType = ifelse(InjurySeverity %in% c("Non-Fatal", "Unavailable"), as.character(InjurySeverity), "Fatal")) %>%
+  filter(!(InjuryType %in% c("Unavailable"))) %>% # remove missing values
+  group_by(InjuryType) %>%
+  slice_max(tf_idf, n=15) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, tf_idf)) %>%
+  ggplot(aes(tf_idf, word, fill = InjuryType)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = "tf-idf", y = NULL) +
+  facet_wrap(~InjuryType, ncol = 2, scales = "free")
+
+```
+
+Insights: Foreign governments are bad news!
+
+Now step away from Tidy and try the old fashioned way. 
+
+```{r}
+library(tm)
+
+# subset the data
+tmp <- df %>%
+  filter(InvestigationType == "Accident") %>% # remove incidents, which are always non-fatal
+  mutate(InjuryType = ifelse(InjurySeverity %in% c("", "Non-Fatal", "Unavailable"), as.character(InjurySeverity), "Fatal")) %>%
+  filter(InjuryType %in% c("Fatal", "Non-Fatal")) %>% # remove missing values
+  mutate(InjuryTypeBin = ifelse(InjuryType=="Fatal", 1, 0))
+  
+# create corpus
+corpus <- Corpus(VectorSource(tmp$narrative))
+
+# remove line breaks
+line_break <- function(x) gsub("\\\\r\\\\n", " ", x) 
+docs.s <- tm_map(corpus, line_break)
+
+# remove stop words
+docs.s <- tm_map(docs.s, removeWords, stopwords("english"))
+
+# remove upper-case
+docs.s <- tm_map(docs.s, content_transformer(tolower))
+
+# remove punctuation
+docs.s <- tm_map(docs.s, removePunctuation, preserve_intra_word_dashes = TRUE)
+
+# remove numbers
+docs.s <- tm_map(docs.s, removeNumbers)
+
+# remove left over "th" from numbers
+docs.s <- tm_map(docs.s, removeWords, c("th"))
+
+# remove white Space
+docs.s <- tm_map(docs.s, stripWhitespace)
+```
+
+```{r}
+# check the first entry
+docs.s[[1]]$content
+```
+
+```{r}
+# create DTM
+dtm <- DocumentTermMatrix(docs.s)
+
+# remove sparse terms
+dtm = removeSparseTerms(dtm, 0.99)
+
+library(wordcloud)
+# generate word cloud
+freq = data.frame(sort(colSums(as.matrix(dtm)), decreasing=TRUE))
+wordcloud(rownames(freq), freq[,1], max.words=40, colors=brewer.pal(1, "Dark2"))
+
+```
+
+```{r}
+# tf-idf
+dtm_tfidf <- DocumentTermMatrix(docs.s, control = list(weighting = weightTfIdf))
+
+# remove sparse terms
+dtm_tfidf = removeSparseTerms(dtm_tfidf, 0.99)
+
+# generate word cloud
+freq = data.frame(sort(colSums(as.matrix(dtm_tfidf)), decreasing=TRUE))
+wordcloud(rownames(freq), freq[,1], max.words=40, colors=brewer.pal(1, "Dark2"))
+```
+
+```{r}
+# convert if-idf DTM to matrix
+DF <- as.matrix(dtm_tfidf)
+
+# response varible (fatality)
+target <- as.matrix(tmp$InjuryTypeBin)
+
+# split data into training and testing sets
+set.seed(123)
+smp_size <- floor(0.75 * nrow(DF))
+train_ind <- sample(seq_len(nrow(DF)), size = smp_size)
+
+train.x <- DF[train_ind, ]
+train.y <- target[train_ind,]
+test.x <- DF[-train_ind, ]
+test.y <- target[-train_ind,]
+```
+
+```{r}
+library(glmnet)
+# fit model
+cvfit=cv.glmnet(train.x[1:5000,], train.y[1:5000], # sample to save computation time
+                family="binomial", 
+                type.measure = "auc")
+
+# plot the penalization parameter against the auc
+plot(cvfit)
+```
+
+This model selects 41 words. 
+
+```{r}
+# extract coefficient values for optimal lambda
+tmp_coeffs <- coef(cvfit, s = "lambda.min")
+  
+# put word names and coefs into data frame
+df_plot <- data.frame(words = colnames(DF)[tmp_coeffs@i], # extract words 
+                    coefs = tmp_coeffs@x[-1]) # extract coefs except intercept
+
+# plot
+df_plot %>%
+  arrange(desc(coefs)) %>%
+  top_n(15) %>%
+  ggplot(aes(x=reorder(words, coefs), y=coefs)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(y = "coefficient",
+       x = NULL,
+       title = "What words were commonly used in narratives of fatal accidents?",
+       subtitle = "Words selected by regularized logistic regression model")
+  
+# plot
+df_plot %>%
+  arrange(desc(coefs)) %>%
+  top_n(-15) %>%
+  ggplot(aes(x=reorder(words, coefs), y=coefs)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(y = "coefficient",
+       x = NULL,
+       title = "What words were commonly used in narratives of non-fatal accidents?",
+       subtitle = "Words selected by regularized logistic regression model")
+
+```
+
+maybe standardize the coefs somehow? There is a standardize coefs argument in the glmnet function. 
+
+Now try the probably cause column
+
+```{r}
+# create new corpus with the probable cause report
+corpus <- Corpus(VectorSource(tmp$probable_cause))
+
+line_break <- function(x) gsub("\\\\r\\\\n", " ", x) 
+
+docs.s <- tm_map(corpus, line_break)
+docs.s <- tm_map(docs.s, removeWords, stopwords("english"))
+docs.s <- tm_map(docs.s, content_transformer(tolower))
+docs.s <- tm_map(docs.s, removePunctuation, preserve_intra_word_dashes = TRUE)
+docs.s <- tm_map(docs.s, removeNumbers)
+docs.s <- tm_map(docs.s, removeWords, c("th"))
+docs.s <- tm_map(docs.s, stripWhitespace)
+
+# create DTM
+dtm <- DocumentTermMatrix(docs.s)
+
+# remove sparse terms
+dtm = removeSparseTerms(dtm, 0.99)
+
+# tf-idf
+dtm_tfidf <- DocumentTermMatrix(docs.s, control = list(weighting = weightTfIdf))
+
+# remove sparse terms
+dtm_tfidf = removeSparseTerms(dtm_tfidf, 0.99)
+
+# convert if-idf DTM to matrix
+DF <- as.matrix(dtm_tfidf)
+
+# response varible (fatality)
+target <- as.matrix(tmp$InjuryTypeBin)
+
+# split data into training and testing sets
+set.seed(123)
+smp_size <- floor(0.75 * nrow(DF))
+train_ind <- sample(seq_len(nrow(DF)), size = smp_size)
+
+train.x <- DF[train_ind, ]
+train.y <- target[train_ind,]
+test.x <- DF[-train_ind, ]
+test.y <- target[-train_ind,]
+
+# fit model
+cvfit=cv.glmnet(train.x[1:5000,], train.y[1:5000], # sample to save computation time
+                family="binomial", 
+                type.measure = "auc")
+
+# plot the penalization parameter against the auc
+plot(cvfit)
+
+# extract coefficient values for optimal lambda
+tmp_coeffs <- coef(cvfit, s = "lambda.min")
+  
+# put word names and coefs into data frame
+df_plot <- data.frame(words = colnames(DF)[tmp_coeffs@i], # extract words 
+                    coefs = tmp_coeffs@x[-1]) # extract coefs except intercept
+
+# plot
+df_plot %>%
+  arrange(desc(coefs)) %>%
+  top_n(15) %>%
+  ggplot(aes(x=reorder(words, coefs), y=coefs)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(y = "coefficient",
+       x = NULL,
+       title = "What words were commonly used in narratives of fatal accidents?",
+       subtitle = "Words selected by regularized logistic regression model")
+  
+# plot
+df_plot %>%
+  arrange(desc(coefs)) %>%
+  top_n(-15) %>%
+  ggplot(aes(x=reorder(words, coefs), y=coefs)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(y = "coefficient",
+       x = NULL,
+       title = "What words were commonly used in narratives of non-fatal accidents?",
+       subtitle = "Words selected by regularized logistic regression model")
+
+```
+
+note: L1 and L2 norm intuition is the plot of x and y axes (circle is L1, diamong is L)
+
+# Topic modeling using LDA
+
+https://slcladal.github.io/topicmodels.html
+
+```{r}
+# for posterity, make the dtm again
+
+# subset the data
+tmp <- df %>%
+  filter(InvestigationType == "Accident") %>% # remove incidents, which are always non-fatal
+  mutate(InjuryType = ifelse(InjurySeverity %in% c("", "Non-Fatal", "Unavailable"), as.character(InjurySeverity), "Fatal")) %>%
+  filter(InjuryType %in% c("Fatal", "Non-Fatal")) %>% # remove missing values
+  mutate(InjuryTypeBin = ifelse(InjuryType=="Fatal", 1, 0))
+  
+
+# create corpus
+corpus <- Corpus(VectorSource(tmp$probable_cause))
+
+# remove line breaks, words, punctuation, numbers
+line_break <- function(x) gsub("\\\\r\\\\n", " ", x) 
+docs.s <- tm_map(corpus, line_break)
+docs.s <- tm_map(docs.s, content_transformer(tolower))
+docs.s <- tm_map(docs.s, removeWords, stopwords("english"))
+docs.s <- tm_map(docs.s, removePunctuation, preserve_intra_word_dashes = TRUE)
+docs.s <- tm_map(docs.s, removeNumbers)
+docs.s <- tm_map(docs.s, removeWords, c("th"))
+docs.s <- tm_map(docs.s, stripWhitespace)
+
+# remove words that appear in less than 1%, or more than 80% of documents
+ndocs <- length(corpus)
+minDocFreq <- ndocs * 0.01
+maxDocFreq <- ndocs * 0.8
+
+dtm<- DocumentTermMatrix(docs.s, control = list(bounds = list(global = c(minDocFreq, maxDocFreq))))
+```
+
+
+```{r}
+library(topicmodels)
+
+# due to vocabulary pruning, we have empty rows in our DTM
+# LDA does not like this. So we remove those docs from the
+# DTM and the metadata
+sel_idx <- slam::row_sums(dtm) > 0
+dtm_lda <- dtm[sel_idx, ]
+tmp_lda <- tmp[sel_idx, ]
+# number of topics
+K <- 10
+
+# set random number generator seed
+set.seed(123)
+
+# compute the LDA model, inference via 1000 iterations of Gibbs sampling
+topicModel <- LDA(dtm_lda, K, method="Gibbs", control=list(iter = 500, verbose = 25))
+```
+
+```{r}
+# have a look a some of the results (posterior distributions)
+tmResult <- posterior(topicModel)
+# format of the resulting object
+attributes(tmResult)
+# length of vocab
+nTerms(dtm_lda) 
+# topics are probability distribtions over the entire vocabulary
+beta <- tmResult$terms   # get beta from results
+dim(beta)                # K distributions over nTerms(DTM) terms
+rowSums(beta) # should sum to 1
+
+# for every document we have a probaility distribution of its contained topics
+theta <- tmResult$topics 
+dim(theta)   
+```
+
+149 words in the probable cause column
+1010 words in the narrative column
+
+```{r}
+terms(topicModel, 10)
+```
+
+Consider trying a different alpha. Higher alpha priors for topics result in an even distribution of topics within a document. Low alpha priors ensure that the inference process distributes the probability mass on a few topics for each document.
+
+```{r}
+attr(topicModel, "alpha") 
+
+# K <- 10
+# topicModel <- LDA(dtm_lda, K, method="Gibbs", control=list(iter = 500, verbose = 25, alpha = 1))
+```
+
+```{r}
+# look at terms
+terms(topicModel, 10)
+
+# extract model coefs
+tmResult <- posterior(topicModel)
+theta <- tmResult$topics
+beta <- tmResult$terms
+
+# create topic names by pasting the 5 most common words
+topicNames <- apply(terms(topicModel, 5), 2, paste, collapse = " ")  # reset topicnames
+```
+
+re-rank terms in order to favor less common words, similar to df-idf
+
+```{r}
+# re-rank top topic terms for topic names
+topicNames <- apply(lda::top.topic.words(beta, 5, by.score = T), 2, paste, collapse = " ")
+```
+
+What are the most common topics in the entire collection?
+
+```{r}
+# What are the most probable topics in the entire collection?
+topicProportions <- colSums(theta) / nDocs(dtm_lda)  # mean probablities over all entries
+names(topicProportions) <- topicNames     # assign the topic names we created before
+sort(topicProportions, decreasing = TRUE) # show summed proportions in decreased order
+```
+
+What are the most common topics in fatal versus non-fatal accidents?
+
+```{r}
+ # mean probablities over all entries
+fatalProportions <- colSums(theta[tmp_lda$InjuryType=="Fatal",]) / nDocs(dtm_lda[tmp_lda$InjuryType=="Fatal",])
+nonfatalProportions <- colSums(theta[tmp_lda$InjuryType=="Non-Fatal",]) / nDocs(dtm_lda[tmp_lda$InjuryType=="Non-Fatal",])
+
+tmp_plt <- data.frame(Fatal = fatalProportions,
+                      NonFatal = nonfatalProportions,
+                      Topic = topicNames) %>%
+  pivot_longer(c(Fatal, NonFatal), names_to = 'InjuryType', values_to = 'freq') %>%
+  mutate(Topic = tidytext::reorder_within(Topic, freq, InjuryType))
+  
+
+ggplot(tmp_plt, aes(x=Topic, y=freq, fill=InjuryType)) +
+  geom_bar(stat = "identity") +
+  theme(legend.position = "none") +
+  coord_flip() +
+  tidytext::scale_x_reordered() + 
+  facet_wrap(vars(InjuryType), scales = "free") +
+  labs(y = "Frequency",
+       x = NULL,
+       title = "Frequency of topics in all 'probable cause' entries",
+       subtitle = "Topic frequency is separated by fatal and non-fatal accidents")
+```
+
+Suppose you wanted to know what engine types are associated with "loss engine power undetermined reasons"
+
+Topic 7 is failure airplane control the maintenance
+
+```{r}
+# topic 10: loss engine power undetermined reasons
+tmp_top <- cbind(tmp_lda, theta) %>%
+  filter(AircraftCategory %in% c("Airplane", "Helicopter"),
+         EngineType %in% c("Reciproacting", "Turbo Fan", "Turbo Jet", "Turbo Prop", "Turbo Shaft")) %>%
+  mutate(Make = ifelse(grepl("ROBINSON", Make, fixed = T)==T, "ROBINSON", as.character(Make))) %>% # consolidate duplicate names
+  mutate(Make = toupper(Make)) %>% # consolidate duplicate names
+  mutate(MakeModel = paste(Make, Model, sep = " ")) %>%
+  filter(InjuryType=="Fatal")
+
+ggplot(tmp_top, aes(x=EngineType, y=`10`, fill=EngineType)) +
+  geom_boxplot() +
+  ggtitle("Fatal accidents. Which engines are associatd with loss of engine power?")
+
+# Compute the analysis of variance
+res.aov <- aov(`10` ~ EngineType, data = tmp_top)
+# Summary of the analysis
+summary(res.aov)
+
+```
+
+nothing significant. 
+
+```{r}
+# topic 10: loss engine power undetermined reasons
+tmp_top <- cbind(tmp_lda, theta) %>%
+  filter(AircraftCategory %in% c("Airplane", "Helicopter"),
+         EngineType %in% c("Reciproacting", "Turbo Fan", "Turbo Jet", "Turbo Prop", "Turbo Shaft")) %>%
+  mutate(Make = ifelse(grepl("ROBINSON", Make, fixed = T)==T, "ROBINSON", as.character(Make))) %>% # consolidate duplicate names
+  mutate(Make = toupper(Make)) %>% # consolidate duplicate names
+  mutate(MakeModel = paste(Make, Model, sep = " ")) %>%
+  group_by(MakeModel) %>%
+  mutate(n = n()) %>%
+  filter(n>7) 
+
+ggplot(tmp_top, aes(x=MakeModel, y=`10`, fill=MakeModel)) +
+  geom_boxplot() +
+  ggtitle("Fatal accidents. Which engines are associatd with loss of engine power?") +
+  xlab("") +
+  coord_flip() +
+  theme(legend.position = "none") 
+  
+
+# Compute the analysis of variance
+res.aov <- aov(`10` ~ MakeModel, data = tmp_top)
+# Summary of the analysis
+summary(res.aov)
+
+# If ANOVA significant, then run TukeyHSD to get pairwise 
+as.data.frame(TukeyHSD(res.aov)$MakeModel) %>%
+  filter(`p adj` <= 0.05) %>%
+  arrange()
+```
+
+some helicoptors are clearly superior to others. 
+
+(no more interesting questions, move on).
+
+
+Other ones to investigate:
+
+4: approach flight proper failure runway ("dangerous runway")
+6: maintain failure airspeed adequate stall ("bad pilot")
+8: terrain factors accident takeoff high ("dangerous runway")
+9: conditions flight factors lack weather
+
+In what states to bad pilots live?
+
+note that MP (abbreviation) is Northern Mariana Islands (near Guam). Lots of engine failure crashes here! I'm guessing due to military activity. 
+
+```{r}
+# get us map data
+library(maps)
+states <- map_data("state") %>% # download state data
+  mutate(region = str_to_title(region))
+# add the state abbreviation
+states$State <- state.abb[match(states$region,state.name)]
+```
+
+```{r}
+tmp_top <- cbind(tmp_lda, theta) %>%
+  filter(Country %in% c("United States")) %>%
+  mutate(State = str_extract(Location, '\\b[^,]+$')) %>% # everything after the comma
+  filter(State %in% states$State) %>% # remove puerto rico, etc
+  group_by(State) %>%
+  summarise(value = mean(`6`)) %>%
+  right_join(states, by="State")
+
+library(ggthemes)
+ggplot(data = tmp_top, mapping = aes(x = long, y = lat, group = group, fill = value)) +
+  geom_polygon(color = "gray90", size = 0.1) +
+  coord_map(projection = "albers", lat0 = 39, lat1 = 45) +
+  scale_fill_gradient(
+                      breaks=c(min(tfmerged$value),max(tfmerged$value)),
+                      labels=c("Minimum","Maximum"),
+                      low = "white",
+                      high = "brown") + 
+  labs(title = "Title of map",
+       fill = "Pilot error") +
+  theme_map() 
+```
+
+Now plot the take-off terrain one (8) 
+
+```{r}
+tmp_top <- cbind(tmp_lda, theta) %>%
+  filter(Country %in% c("United States")) %>%
+  mutate(State = str_extract(Location, '\\b[^,]+$')) %>% # everything after the comma
+  filter(State %in% states$State) %>% # remove puerto rico, etc
+  group_by(State) %>%
+  summarise(value = mean(`8`)) %>%
+  right_join(states, by="State")
+
+library(ggthemes)
+ggplot(data = tmp_top, mapping = aes(x = long, y = lat, group = group, fill = value)) +
+  geom_polygon(color = "gray90", size = 0.1) +
+  coord_map(projection = "albers", lat0 = 39, lat1 = 45) +
+  scale_fill_gradient(
+                      breaks=c(min(tfmerged$value),max(tfmerged$value)),
+                      labels=c("Minimum","Maximum"),
+                      low = "white",
+                      high = "brown") + 
+  labs(title = "Title of map",
+       fill = "Pilot error") +
+  theme_map() 
+```
+
+Which airports have the most dangerous runways to land on (4)?
+
+```{r}
+tmp_top <- cbind(tmp_lda, theta) %>%
+ filter(Country %in% c("United States")) %>%
+  mutate(State = str_extract(Location, '\\b[^,]+$')) %>% # everything after the comma
+  filter(State %in% states$State) %>% # remove puerto rico, etc
+  mutate(AirportName = toupper(AirportName)) %>%
+  mutate(AirportName = ifelse(grepl("PRIVATE", AirportName, fixed = T)==T, "PRIVATE", as.character(AirportName))) %>%
+  mutate(AirportName = na_if(AirportName, "N/A")) %>%
+  mutate(AirportName = na_if(AirportName, "NONE")) %>%
+  drop_na(AirportName) %>%
+  group_by(State, AirportName) %>%
+  summarise(value = mean(`4`)) %>%
+  arrange(desc(value))
+
+head(tmp_top)
+```
+
+Which months are associated with bad weather accidents (9)?
+
+```{r}
+library(lubridate)
+
+# function to scale a variable to 0-1
+range01 <- function(x){(x-min(x))/(max(x)-min(x))}
+
+tmp_top <- cbind(tmp_lda, theta) %>%
+ filter(Country %in% c("United States")) %>%
+ mutate(EventDate = mdy(EventDate),
+         Month = month(EventDate, label = T)) %>%
+ group_by(Month) %>%
+ summarise(value = mean(`9`)) %>%
+  mutate(value = range01(value)) %>%
+ arrange(desc(value)) %>%
+  mutate(dummy = factor(Month, ordered = F)) # for plotting
+
+# Plot
+ggplot(tmp_top, aes(Month, value, fill=dummy)) + 
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(title = "Which months are correlated with weather-related crashes?",
+       subtitle = "The topic of weather-related crashes is rescaled from 0-1",
+       x = "Month",
+       y = "Topic: crash due to weather (rescaled)")
+       
+```
+
+time-series 
+
+```{r}
+tmp_top <- cbind(tmp_lda, theta) %>%
+  #filter(InjuryType=="Fatal") %>% # this looks cooler
+  mutate(EventDate = mdy(EventDate),
+         Year = year(EventDate)) %>%
+  mutate(Decade = case_when(
+    Year >= 1980 & Year < 1990 ~ '1980',
+    Year >= 1990 & Year < 2000 ~ '1990',
+    Year >= 2000 & Year < 2010 ~ '2000',
+    Year >= 2010 & Year < 2020 ~ '2010'
+  )) %>%
+  group_by(Decade) %>%
+  summarise_at(as.character(seq(1,10)), mean) %>%
+  rename_at(vars(as.character(seq(1,10))), ~ topicNames) %>% # add topic names
+  pivot_longer(cols = -Decade, names_to = "topic", values_to = "value") %>%
+  drop_na()
+  
+# plot
+ggplot(tmp_top, aes(x=Decade, y=value, fill=topic)) + 
+  geom_bar(stat = "identity") + ylab("proportion") + 
+  scale_fill_brewer(palette="Paired") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
